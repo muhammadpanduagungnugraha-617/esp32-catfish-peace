@@ -188,7 +188,7 @@ static void initFirebase() {
     auth.user.email = FIREBASE_USER_EMAIL;
     auth.user.password = FIREBASE_USER_PASSWORD;
   } else {
-    if (!Firebase.signUp(&auth, &config, "", "")) {
+    if (!Firebase.signUp(&config, &auth, "", "")) {
       Serial.printf("[FB] Signup anonim gagal: %s\n", config.signer.signupError.message.c_str());
       Serial.println("[FB] Aktifkan Anonymous Auth, atau isi FIREBASE_USER_EMAIL di secrets.h.");
       return;
