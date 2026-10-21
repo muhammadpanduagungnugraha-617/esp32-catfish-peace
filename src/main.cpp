@@ -65,7 +65,6 @@ FirebaseConfig config;
 
 bool firebaseSiap = false;
 bool controlNodeSiap = false;
-bool onDisconnectTerpasang = false;
 bool wifiTerkonfigurasi = false;
 bool ntpDikonfigurasi = false;
 
@@ -217,8 +216,7 @@ static void jagaKoneksi() {
     return;
   }
 
-  // Wi-Fi putus: onDisconnect di server sudah/akan terpicu, pasang ulang nanti.
-  onDisconnectTerpasang = false;
+  // Wi-Fi putus: coba sambung ulang berkala.
   if (wifiTerkonfigurasi && now - tCobaSambung >= INTERVAL_COBA_SAMBUNG_MS) {
     tCobaSambung = now;
     Serial.println("[WIFI] Terputus, mencoba menyambung ulang...");
@@ -252,13 +250,10 @@ static void pastikanControlDefault() {
   controlNodeSiap = true;
 }
 
-static void pasangOnDisconnect() {
-  if (!Firebase.ready() || onDisconnectTerpasang) return;
-  if (Firebase.RTDB.setOnDisconnectBool(&fbdo, "/kolam_status/is_connected", false)) {
-    onDisconnectTerpasang = true;
-    Serial.println("[FB] onDisconnect: is_connected=false.");
-  }
-}
+// CATATAN: library Firebase Arduino Client (4.4.x) TIDAK mendukung onDisconnect,
+// jadi is_connected tidak bisa otomatis menjadi false saat alat putus mendadak.
+// Itu tidak masalah: app menilai "Terputus" dari last_updated yang basi (> 6 detik),
+// bukan dari is_connected. is_connected hanya dikirim true bersama tiap pembaruan.
 
 // Baca seluruh kolam_control dalam SATU request (dulu 4 request terpisah).
 // Field hilang = mati; mode_otomatis hilang = otomatis (sesuai kontrak).
@@ -453,7 +448,6 @@ void loop() {
   const bool saatnyaSinkron = (millis() - tUpdateTerakhir >= INTERVAL_UPDATE_MS);
   if (saatnyaSinkron && firebaseSiap && Firebase.ready()) {
     pastikanControlDefault();
-    pasangOnDisconnect();
     if (bacaPerintahKontrol()) tKontrolOk = millis();
   }
 
