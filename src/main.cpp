@@ -27,6 +27,7 @@
 #define RELAY_OFF HIGH
 
 static const unsigned long INTERVAL_UPDATE_MS = 2000; 
+static const unsigned long INTERVAL_KONTROL_MS = 1000;   // seberapa sering perintah app dibaca
 static const unsigned long INTERVAL_RELAY_MIN_MS = 1000;
 static const unsigned long INTERVAL_RELAY_HEARTBEAT_MS = 10000;
 // ======================== MODE UJI SKENARIO ========================
@@ -42,6 +43,7 @@ static const unsigned long INTERVAL_HISTORY_MS = 1UL * 60UL * 1000UL;
 #endif
 static const unsigned long INTERVAL_COBA_SAMBUNG_MS = 15000;
 static const unsigned long CONTROL_FAILSAFE_MS = 30000;
+static const unsigned long COOLDOWN_SIKLUS_MS = 60000;   // jeda setelah siklus pompa kena timeout
 
 // ======================== SETUP SENSOR & VARIABEL ========================
 OneWire oneWire(ONE_WIRE_BUS);
@@ -87,7 +89,15 @@ unsigned long tRelayTulis = 0;
 unsigned long tHistoryTerakhir = 0;
 bool historyPernahDitulis = false;
 unsigned long tCobaSambung = 0;
-unsigned long tKontrolOk = 0; 
+unsigned long tKontrolOk = 0;
+unsigned long tKontrolPoll = 0;
+unsigned long tCooldownSampai = 0;
+bool modeSebelumnya = true;
+
+// Hasil sampling sensor terakhir (diambil tiap INTERVAL_UPDATE_MS, bukan tiap loop)
+float gSuhu = 0, gPH = 0, gNTU = 0, gAmonia = 0, gJarak = 0;
+unsigned long tSampel = 0;
+bool sampelAda = false;
 uint8_t percobaanCekControl = 0;
 
 static void setRelay(int pin, bool nyala) {
@@ -349,6 +359,8 @@ void setup() {
   delay(1000);
 
   sensors.begin();
+  sensors.setWaitForConversion(false);
+  sensors.requestTemperatures();
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
   pinMode(PH_PIN, INPUT);
@@ -374,9 +386,19 @@ void setup() {
 
 void loop() {
   jagaKoneksi();
-  
+
+  float dataSuhu = gSuhu, dataPH = gPH, dataTurbidity = gNTU;
+  float dataAmonia = gAmonia, jarakKeAir = gJarak;
+
+  // Sensor dibaca tiap INTERVAL_UPDATE_MS saja, supaya loop tetap cepat
+  // menanggapi perintah aktuator dari app.
+  if (!sampelAda || millis() - tSampel >= INTERVAL_UPDATE_MS) {
+  tSampel = millis();
+  sampelAda = true;
+
+  // DS18B20 non-blocking: ambil hasil konversi sebelumnya, minta konversi baru.
+  dataSuhu = sensors.getTempCByIndex(0);
   sensors.requestTemperatures();
-  float dataSuhu = sensors.getTempCByIndex(0);
   if (isnan(dataSuhu) || isinf(dataSuhu) || dataSuhu <= -100.0f) dataSuhu = 0.0f;
 
   float phAdcSum = 0;
@@ -385,7 +407,7 @@ void loop() {
     delay(5);
   }
   float phVoltage = (phAdcSum / 20.0 / 4095.0) * 3.3;
-  float dataPH = 7.00 + ((voltageAtPH7 - phVoltage) / 0.18);
+  dataPH = 7.00 + ((voltageAtPH7 - phVoltage) / 0.18);
   if (isnan(dataPH) || isinf(dataPH) || dataPH < 0) dataPH = 0.0f;
   if (dataPH > 14.0f) dataPH = 14.0f;
 
@@ -397,7 +419,7 @@ void loop() {
   float turbVoltage = (turbAdcSum / 20.0 / 4095.0) * 3.3 * CALIBRATION_FACTOR;
   if (turbVoltage > 4.2) turbVoltage = 4.2;
   if (turbVoltage < 2.5) turbVoltage = 2.5;
-  float dataTurbidity = -1120.4 * (turbVoltage * turbVoltage) + 5742.3 * turbVoltage - 4352.9;
+  dataTurbidity = -1120.4 * (turbVoltage * turbVoltage) + 5742.3 * turbVoltage - 4352.9;
   if (isnan(dataTurbidity) || isinf(dataTurbidity) || dataTurbidity < 0) dataTurbidity = 0.0f;
 
   float mqAdcSum = 0;
@@ -409,19 +431,24 @@ void loop() {
   if (mqVoltage < 0.01) mqVoltage = 0.01;
   float rZero = 20.0;
   float rs = ((3.3 * 10.0) / mqVoltage) - 10.0;
-  float dataAmonia = 5.2 * pow((rs / rZero), -1.48);
+  dataAmonia = 5.2 * pow((rs / rZero), -1.48);
   if (isnan(dataAmonia) || isinf(dataAmonia) || dataAmonia < 0) dataAmonia = 0.0f;
 
-  float jarakKeAir = bacaJarakAir();
+  jarakKeAir = bacaJarakAir();
   if (jarakKeAir == 999) jarakKeAir = 0.0f;
+
+  gSuhu = dataSuhu; gPH = dataPH; gNTU = dataTurbidity;
+  gAmonia = dataAmonia; gJarak = jarakKeAir;
+  }
 
 #if SIMULASI_SKENARIO
   bacaPerintahSerial();
   terapkanSkenario(dataSuhu, dataPH, dataTurbidity, dataAmonia);
 #endif
 
-  const bool saatnyaSinkron = (millis() - tUpdateTerakhir >= INTERVAL_UPDATE_MS);
+  const bool saatnyaSinkron = (millis() - tKontrolPoll >= INTERVAL_KONTROL_MS);
   if (saatnyaSinkron && firebaseSiap && Firebase.ready()) {
+    tKontrolPoll = millis();
     pastikanControlDefault();
     if (bacaPerintahKontrol()) tKontrolOk = millis();
   }
@@ -431,7 +458,20 @@ void loop() {
     Serial.println("[FAILSAFE] Perintah tidak terbaca > 30 dtk, otomatis dihidupkan.");
   }
 
+  // Peralihan mode: bersihkan sisa keadaan mode sebelumnya.
+  if (modeOtomatis != modeSebelumnya) {
+    currentWaterState = IDLE;
+    if (modeOtomatis) {
+      // manual -> otomatis: matikan semua, biar logika otomatis yang memutuskan
+      matikanPompaAir();
+      setRelay(RELAY_AERATOR, false);
+    }
+    Serial.printf("[MODE] %s\n", modeOtomatis ? "OTOMATIS" : "MANUAL");
+    modeSebelumnya = modeOtomatis;
+  }
+
   const bool amoniaBahaya = (dataAmonia >= 0.60);
+  const bool bolehMulaiSiklus = ((long)(millis() - tCooldownSampai) >= 0);
   digitalWrite(BUZZER_PIN, amoniaBahaya ? HIGH : LOW);
 
   if (modeOtomatis) {
@@ -443,13 +483,13 @@ void loop() {
 
     if (amoniaBahaya) {
       setRelay(RELAY_AERATOR, true);
-      if (currentWaterState == IDLE) {
+      if (currentWaterState == IDLE && bolehMulaiSiklus) {
         currentWaterState = DRAINING;
         tSiklusMulai = millis();
       }
     }
 
-    if ((dataPH < 6.0 || dataPH > 9.0 || dataTurbidity > 60.0) && currentWaterState == IDLE && dataPH != 0.0f) {
+    if ((dataPH < 6.0 || dataPH > 9.0 || dataTurbidity > 60.0) && currentWaterState == IDLE && bolehMulaiSiklus && dataPH != 0.0f) {
       currentWaterState = DRAINING;
       tSiklusMulai = millis();
     }
@@ -457,8 +497,8 @@ void loop() {
     if (currentWaterState != IDLE && (millis() - tSiklusMulai > TIMEOUT_POMPA_MS)) {
       matikanPompaAir();
       currentWaterState = IDLE;
-      delay(5000);
-      return;
+      tCooldownSampai = millis() + COOLDOWN_SIKLUS_MS;
+      Serial.println("[POMPA] Siklus melewati batas waktu, dihentikan. Jeda 60 dtk.");
     }
 
     switch (currentWaterState) {
@@ -516,4 +556,6 @@ void loop() {
       dataSuhu, dataPH, dataTurbidity, dataAmonia, jarakKeAir,
       modeOtomatis ? 1 : 0, (long)epochDetik());
   }
+
+  delay(10);  // beri waktu task WiFi/idle
 }
