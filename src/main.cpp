@@ -29,7 +29,7 @@
 static const unsigned long INTERVAL_UPDATE_MS = 2000; 
 static const unsigned long INTERVAL_RELAY_MIN_MS = 1000;
 static const unsigned long INTERVAL_RELAY_HEARTBEAT_MS = 10000;
-static const unsigned long INTERVAL_HISTORY_MS = 5UL * 60UL * 1000UL;
+static const unsigned long INTERVAL_HISTORY_MS = 1UL * 60UL * 1000UL;
 static const unsigned long INTERVAL_COBA_SAMBUNG_MS = 15000;
 static const unsigned long CONTROL_FAILSAFE_MS = 30000;
 
