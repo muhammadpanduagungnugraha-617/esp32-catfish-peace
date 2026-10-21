@@ -8,6 +8,11 @@
 #include "addons/RTDBHelper.h"
 #include "secrets.h"
 
+// Handshake TLS ke Firebase butuh stack besar. Stack default loopTask (8 KB)
+// meluap: "Stack canary watchpoint triggered (loopTask)" lalu reboot berulang.
+// Harus ada di scope global.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+
 // Kontrak data dengan app Flutter: lihat docs/data-contract.md di repo app.
 //   kolam_status   (ESP32 tulis)  : sensor + is_connected + last_updated
 //   kolam_control  (APP tulis)    : mode_otomatis + perintah aktuator
