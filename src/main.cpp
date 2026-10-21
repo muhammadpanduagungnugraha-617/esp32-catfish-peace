@@ -29,7 +29,17 @@
 static const unsigned long INTERVAL_UPDATE_MS = 2000; 
 static const unsigned long INTERVAL_RELAY_MIN_MS = 1000;
 static const unsigned long INTERVAL_RELAY_HEARTBEAT_MS = 10000;
+// ======================== MODE UJI SKENARIO ========================
+// 1 = nilai sensor bisa dipaksa lewat Serial Monitor (kirim '1','2','3','0','a').
+// WAJIB 0 untuk pemasangan sungguhan. Saat uji, LEPAS beban relay: mode
+// otomatis tetap bereaksi pada nilai palsu (bahaya = siklus kuras/isi).
+#define SIMULASI_SKENARIO 1
+
+#if SIMULASI_SKENARIO
+static const unsigned long INTERVAL_HISTORY_MS = 10UL * 1000UL;  // cepat, agar log cepat terisi
+#else
 static const unsigned long INTERVAL_HISTORY_MS = 1UL * 60UL * 1000UL;
+#endif
 static const unsigned long INTERVAL_COBA_SAMBUNG_MS = 15000;
 static const unsigned long CONTROL_FAILSAFE_MS = 30000;
 
@@ -303,6 +313,37 @@ float bacaJarakAir() {
   return duration * 0.034 / 2;
 }
 
+#if SIMULASI_SKENARIO
+// 0 = sensor asli, 1 = aman, 2 = waspada, 3 = bahaya, 9 = siklus otomatis
+static int skenario = 0;
+static unsigned long tSkenario = 0;
+
+static void bacaPerintahSerial() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '0' || c == '1' || c == '2' || c == '3') {
+      skenario = c - '0';
+      Serial.printf("[SIM] Skenario = %d (0 asli, 1 aman, 2 waspada, 3 bahaya)\n", skenario);
+    } else if (c == 'a' || c == 'A') {
+      skenario = 9;
+      tSkenario = millis();
+      Serial.println("[SIM] Siklus otomatis: aman -> waspada -> bahaya, tiap 90 dtk");
+    }
+  }
+}
+
+static void terapkanSkenario(float &suhu, float &ph, float &ntu, float &amonia) {
+  int aktif = skenario;
+  if (aktif == 9) aktif = 1 + (int)(((millis() - tSkenario) / 90000UL) % 3);
+  switch (aktif) {
+    case 1: suhu = 28.0f; ph = 7.2f; ntu = 6.5f;  amonia = 0.15f; break;  // aman
+    case 2: suhu = 30.5f; ph = 8.7f; ntu = 55.0f; amonia = 0.55f; break;  // waspada
+    case 3: suhu = 32.0f; ph = 9.5f; ntu = 70.0f; amonia = 0.70f; break;  // bahaya
+    default: break;
+  }
+}
+#endif
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -373,6 +414,11 @@ void loop() {
 
   float jarakKeAir = bacaJarakAir();
   if (jarakKeAir == 999) jarakKeAir = 0.0f;
+
+#if SIMULASI_SKENARIO
+  bacaPerintahSerial();
+  terapkanSkenario(dataSuhu, dataPH, dataTurbidity, dataAmonia);
+#endif
 
   const bool saatnyaSinkron = (millis() - tUpdateTerakhir >= INTERVAL_UPDATE_MS);
   if (saatnyaSinkron && firebaseSiap && Firebase.ready()) {
