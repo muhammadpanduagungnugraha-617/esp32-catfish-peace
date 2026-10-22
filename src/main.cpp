@@ -34,7 +34,7 @@ static const unsigned long INTERVAL_RELAY_HEARTBEAT_MS = 10000;
 // 1 = nilai sensor bisa dipaksa lewat Serial Monitor (kirim '1','2','3','0','a').
 // WAJIB 0 untuk pemasangan sungguhan. Saat uji, LEPAS beban relay: mode
 // otomatis tetap bereaksi pada nilai palsu (bahaya = siklus kuras/isi).
-#define SIMULASI_SKENARIO 1
+#define SIMULASI_SKENARIO 0
 
 #if SIMULASI_SKENARIO
 static const unsigned long INTERVAL_HISTORY_MS = 10UL * 1000UL;  // cepat, agar log cepat terisi
@@ -43,6 +43,10 @@ static const unsigned long INTERVAL_HISTORY_MS = 1UL * 60UL * 1000UL;
 #endif
 static const unsigned long INTERVAL_COBA_SAMBUNG_MS = 15000;
 static const unsigned long CONTROL_FAILSAFE_MS = 30000;
+static const unsigned long MANUAL_MAX_POMPA_MS = 5UL * 60UL * 1000UL;   // pompa air manual maks 5 menit
+static const unsigned long MANUAL_MAX_PROBIOTIK_MS = 60UL * 1000UL;     // pompa probiotik manual maks 1 menit
+static const float LEVEL_JARAK_KOSONG_CM = 80.0f;  // jarak >= ini: bak hampir kosong
+static const float LEVEL_JARAK_PENUH_CM = 5.0f;    // jarak <= ini: bak penuh
 static const unsigned long COOLDOWN_SIKLUS_MS = 60000;   // jeda setelah siklus pompa kena timeout
 
 // ======================== SETUP SENSOR & VARIABEL ========================
@@ -96,9 +100,16 @@ bool modeSebelumnya = true;
 
 // Hasil sampling sensor terakhir (diambil tiap INTERVAL_UPDATE_MS, bukan tiap loop)
 float gSuhu = 0, gPH = 0, gNTU = 0, gAmonia = 0, gJarak = 0;
+bool gSensorOk = false;   // keempat sensor air terbaca wajar
+bool gJarakOk = false;    // sensor level air mendapat echo
 unsigned long tSampel = 0;
 bool sampelAda = false;
 uint8_t percobaanCekControl = 0;
+
+// ADC rata-rata di rel (≈0 atau ≈4095) = sensor lepas / korslet.
+static bool adcWajar(float adcRata) {
+  return adcRata > 50.0f && adcRata < 4040.0f;
+}
 
 static void setRelay(int pin, bool nyala) {
   digitalWrite(pin, nyala ? RELAY_ON : RELAY_OFF);
@@ -248,6 +259,34 @@ static bool bacaPerintahKontrol() {
   return true;
 }
 
+// Pengaman pompa manual. Mengembalikan apakah relay boleh nyala. Bila ditolak
+// (blokir level / lewat batas waktu), perintah di RTDB dikembalikan ke false
+// supaya app dan alat sama.
+struct BatasManual { bool aktif; unsigned long mulai; };
+static BatasManual batasManual[3];
+
+static bool batasiManual(int i, bool minta, bool blokir, unsigned long maxMs, const char *key, bool &cmdVar) {
+  if (!minta) {
+    batasManual[i].aktif = false;
+    return false;
+  }
+  if (!batasManual[i].aktif) {
+    batasManual[i].aktif = true;
+    batasManual[i].mulai = millis();
+  }
+  const bool lewat = millis() - batasManual[i].mulai > maxMs;
+  if (!blokir && !lewat) return true;
+
+  Serial.printf("[MANUAL] %s dimatikan: %s\n", key, blokir ? "level air tidak mengizinkan" : "melewati batas waktu");
+  cmdVar = false;
+  batasManual[i].aktif = false;
+  if (Firebase.ready()) {
+    String path = String("/kolam_control/") + key;
+    Firebase.RTDB.setBool(&fbdo, path.c_str(), false);
+  }
+  return false;
+}
+
 static void kirimStatusRelay() {
   if (!Firebase.ready()) return;
 
@@ -275,7 +314,7 @@ static void kirimStatusRelay() {
   }
 }
 
-static void kirimKolamStatus(float suhu, float ph, float ntu, float amonia, float jarakCm) {
+static void kirimKolamStatus(float suhu, float ph, float ntu, float amonia, float jarakCm, bool sensorOk) {
   if (!Firebase.ready()) return;
 
   const time_t epoch = epochDetik();
@@ -283,7 +322,8 @@ static void kirimKolamStatus(float suhu, float ph, float ntu, float amonia, floa
 
   FirebaseJson json;
   json.set("is_connected", true);
-  json.set("status_kondisi", labelStatus(suhu, ph, ntu, amonia));
+  json.set("sensor_ok", sensorOk);
+  json.set("status_kondisi", sensorOk ? labelStatus(suhu, ph, ntu, amonia) : "Sensor error");
   json.set("suhu", suhu);
   json.set("ph", ph);
   json.set("kekeruhan", ntu);
@@ -295,6 +335,8 @@ static void kirimKolamStatus(float suhu, float ph, float ntu, float amonia, floa
     Serial.printf("[FB] Gagal tulis kolam_status: %s\n", fbdo.errorReason().c_str());
     return;
   }
+
+  if (!sensorOk) return;  // riwayat hanya untuk pembacaan sah
 
   const unsigned long now = millis();
   if (!historyPernahDitulis || now - tHistoryTerakhir >= INTERVAL_HISTORY_MS) {
@@ -389,6 +431,7 @@ void loop() {
 
   float dataSuhu = gSuhu, dataPH = gPH, dataTurbidity = gNTU;
   float dataAmonia = gAmonia, jarakKeAir = gJarak;
+  bool sensorOk = gSensorOk, jarakOk = gJarakOk;
 
   // Sensor dibaca tiap INTERVAL_UPDATE_MS saja, supaya loop tetap cepat
   // menanggapi perintah aktuator dari app.
@@ -399,13 +442,15 @@ void loop() {
   // DS18B20 non-blocking: ambil hasil konversi sebelumnya, minta konversi baru.
   dataSuhu = sensors.getTempCByIndex(0);
   sensors.requestTemperatures();
-  if (isnan(dataSuhu) || isinf(dataSuhu) || dataSuhu <= -100.0f) dataSuhu = 0.0f;
+  const bool suhuOk = !(isnan(dataSuhu) || isinf(dataSuhu) || dataSuhu <= -50.0f || dataSuhu >= 85.0f);
+  if (!suhuOk) dataSuhu = 0.0f;
 
   float phAdcSum = 0;
   for (int i = 0; i < 20; i++) {
     phAdcSum += analogRead(PH_PIN);
     delay(5);
   }
+  const bool phOk = adcWajar(phAdcSum / 20.0f);
   float phVoltage = (phAdcSum / 20.0 / 4095.0) * 3.3;
   dataPH = 7.00 + ((voltageAtPH7 - phVoltage) / 0.18);
   if (isnan(dataPH) || isinf(dataPH) || dataPH < 0) dataPH = 0.0f;
@@ -416,6 +461,7 @@ void loop() {
     turbAdcSum += analogRead(TURBIDITY_PIN);
     delay(5);
   }
+  const bool turbOk = adcWajar(turbAdcSum / 20.0f);
   float turbVoltage = (turbAdcSum / 20.0 / 4095.0) * 3.3 * CALIBRATION_FACTOR;
   if (turbVoltage > 4.2) turbVoltage = 4.2;
   if (turbVoltage < 2.5) turbVoltage = 2.5;
@@ -427,6 +473,7 @@ void loop() {
     mqAdcSum += analogRead(MQ135_PIN);
     delay(5);
   }
+  const bool mqOk = adcWajar(mqAdcSum / 20.0f);
   float mqVoltage = (mqAdcSum / 20.0 / 4095.0) * 3.3;
   if (mqVoltage < 0.01) mqVoltage = 0.01;
   float rZero = 20.0;
@@ -435,7 +482,14 @@ void loop() {
   if (isnan(dataAmonia) || isinf(dataAmonia) || dataAmonia < 0) dataAmonia = 0.0f;
 
   jarakKeAir = bacaJarakAir();
+  gJarakOk = (jarakKeAir != 999 && jarakKeAir > 2.0f && jarakKeAir < 400.0f);
   if (jarakKeAir == 999) jarakKeAir = 0.0f;
+
+  gSensorOk = suhuOk && phOk && turbOk && mqOk;
+  if (!gSensorOk) {
+    Serial.printf("[SENSOR] Tidak valid:%s%s%s%s\n", suhuOk ? "" : " suhu", phOk ? "" : " pH",
+                  turbOk ? "" : " kekeruhan", mqOk ? "" : " amonia");
+  }
 
   gSuhu = dataSuhu; gPH = dataPH; gNTU = dataTurbidity;
   gAmonia = dataAmonia; gJarak = jarakKeAir;
@@ -444,6 +498,7 @@ void loop() {
 #if SIMULASI_SKENARIO
   bacaPerintahSerial();
   terapkanSkenario(dataSuhu, dataPH, dataTurbidity, dataAmonia);
+  if (skenario != 0) { sensorOk = true; jarakOk = true; }
 #endif
 
   const bool saatnyaSinkron = (millis() - tKontrolPoll >= INTERVAL_KONTROL_MS);
@@ -466,18 +521,19 @@ void loop() {
       matikanPompaAir();
       setRelay(RELAY_AERATOR, false);
     }
+    for (int i = 0; i < 3; i++) batasManual[i].aktif = false;
     Serial.printf("[MODE] %s\n", modeOtomatis ? "OTOMATIS" : "MANUAL");
     modeSebelumnya = modeOtomatis;
   }
 
-  const bool amoniaBahaya = (dataAmonia >= 0.60);
-  const bool bolehMulaiSiklus = ((long)(millis() - tCooldownSampai) >= 0);
+  const bool amoniaBahaya = sensorOk && (dataAmonia >= 0.60);
+  const bool bolehMulaiSiklus = ((long)(millis() - tCooldownSampai) >= 0) && jarakOk;
   digitalWrite(BUZZER_PIN, amoniaBahaya ? HIGH : LOW);
 
   if (modeOtomatis) {
-    if (dataSuhu > 31.0 && dataSuhu != 0.0f) {
+    if (sensorOk && dataSuhu > 31.0) {
       setRelay(RELAY_AERATOR, true);
-    } else if (dataSuhu <= 25.0 && currentWaterState == IDLE && !amoniaBahaya) {
+    } else if (sensorOk && dataSuhu <= 25.0 && currentWaterState == IDLE && !amoniaBahaya) {
       setRelay(RELAY_AERATOR, false);
     }
 
@@ -489,9 +545,17 @@ void loop() {
       }
     }
 
-    if ((dataPH < 6.0 || dataPH > 9.0 || dataTurbidity > 60.0) && currentWaterState == IDLE && bolehMulaiSiklus && dataPH != 0.0f) {
+    if (sensorOk && (dataPH < 6.0 || dataPH > 9.0 || dataTurbidity > 60.0) && currentWaterState == IDLE && bolehMulaiSiklus) {
       currentWaterState = DRAINING;
       tSiklusMulai = millis();
+    }
+
+    // Tanpa pembacaan level yang sah, pompa kuras/isi tidak boleh jalan.
+    if ((currentWaterState == DRAINING || currentWaterState == FILLING) && !jarakOk) {
+      matikanPompaAir();
+      currentWaterState = IDLE;
+      tCooldownSampai = millis() + COOLDOWN_SIKLUS_MS;
+      Serial.println("[POMPA] Sensor level tidak valid, siklus dihentikan.");
     }
 
     if (currentWaterState != IDLE && (millis() - tSiklusMulai > TIMEOUT_POMPA_MS)) {
@@ -506,7 +570,7 @@ void loop() {
         setRelay(RELAY_PEMBUANGAN, true);
         setRelay(RELAY_PENGISIAN, false);
         setRelay(RELAY_AERATOR, true);
-        if (jarakKeAir >= 80.0 || jarakKeAir == 0) {
+        if (jarakKeAir >= LEVEL_JARAK_KOSONG_CM) {
           setRelay(RELAY_PEMBUANGAN, false);
           currentWaterState = FILLING;
           tSiklusMulai = millis();
@@ -516,7 +580,7 @@ void loop() {
       case FILLING:
         setRelay(RELAY_PEMBUANGAN, false);
         setRelay(RELAY_PENGISIAN, true);
-        if (jarakKeAir <= 5.0 && jarakKeAir != 0) {
+        if (jarakKeAir <= LEVEL_JARAK_PENUH_CM) {
           setRelay(RELAY_PENGISIAN, false);
           probioticStartTime = millis();
           currentWaterState = PROBIOTIC_INJECT;
@@ -538,10 +602,17 @@ void loop() {
     }
   } else {
     currentWaterState = IDLE;
-    setRelay(RELAY_PEMBUANGAN, cmdPompaBuang);
-    setRelay(RELAY_PENGISIAN, cmdPompaIsi);
+    // Pengaman manual: pompa air tidak boleh jalan kering / meluap, dan semua
+    // pompa punya batas waktu. Perintah yang ditolak dikembalikan ke false.
+    const bool kering = jarakOk && jarakKeAir >= LEVEL_JARAK_KOSONG_CM;
+    const bool penuh = jarakOk && jarakKeAir <= LEVEL_JARAK_PENUH_CM;
+    const bool buang = batasiManual(0, cmdPompaBuang, kering, MANUAL_MAX_POMPA_MS, "pompa_buang_air", cmdPompaBuang);
+    const bool isi = batasiManual(1, cmdPompaIsi, penuh, MANUAL_MAX_POMPA_MS, "pompa_isi_air", cmdPompaIsi);
+    const bool prob = batasiManual(2, cmdPompaProbiotik, false, MANUAL_MAX_PROBIOTIK_MS, "pompa_probiotik", cmdPompaProbiotik);
+    setRelay(RELAY_PEMBUANGAN, buang);
+    setRelay(RELAY_PENGISIAN, isi);
     setRelay(RELAY_AERATOR, cmdAerator);
-    setRelay(RELAY_PROBIOTIK, cmdPompaProbiotik);
+    setRelay(RELAY_PROBIOTIK, prob);
   }
 
   if (firebaseSiap) kirimStatusRelay();
@@ -549,7 +620,7 @@ void loop() {
   if (millis() - tUpdateTerakhir >= INTERVAL_UPDATE_MS) {
     tUpdateTerakhir = millis();
     if (firebaseSiap) {
-      kirimKolamStatus(dataSuhu, dataPH, dataTurbidity, dataAmonia, jarakKeAir);
+      kirimKolamStatus(dataSuhu, dataPH, dataTurbidity, dataAmonia, jarakKeAir, sensorOk);
     }
     Serial.printf(
       "S=%.1f pH=%.1f NTU=%.1f NH3=%.2f d=%.0fcm auto=%d epoch=%ld\n",
